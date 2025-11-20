@@ -1,0 +1,930 @@
+#!/cbin/bin/python3
+"""
+Simple SWAT weather to NetCDF converter - Raw data only, no interpolation
+"""
+
+import warnings
+warnings.filterwarnings('ignore')
+
+import geopandas as gpd
+import geopandas
+import pandas as pd
+import pandas
+import numpy as np
+import numpy
+import datetime
+try:
+    from netCDF4 import Dataset, date2num
+except ImportError:
+    print("Error: netCDF4 not available. Install with: pip install netcdf4")
+    Dataset, date2num = None, None
+
+import os, sys
+from typing import Any, Dict, List, Tuple, cast
+import multiprocessing as mp
+from multiprocessing import shared_memory
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+
+import scipy as scipy
+from shapely.geometry import LineString, Polygon, MultiPolygon, box, Point
+from shapely.ops import polygonize, unary_union
+
+
+class StationData:
+    def __init__(self):
+        self.lat = 0.0
+        self.lon = 0.0
+        self.elev = 0.0
+        self.timeSeries = []
+        self.value = 0.0
+
+def convertCoordinates(coords, srcEpsg, dstCrs):
+    """Convert coordinates from source to destination CRS"""
+    if len(coords) == 0:
+        return np.array([])
+    
+    try:
+        points = [Point(lon, lat) for lon, lat in coords]
+        gdf = gpd.GeoDataFrame(geometry=points, crs=f"EPSG:{srcEpsg}")
+        gdfConverted = gdf.to_crs(dstCrs)
+        convertedCoords = np.column_stack((gdfConverted.geometry.x, gdfConverted.geometry.y))
+        return convertedCoords
+    except Exception as e:
+        print(f"Warning: Coordinate conversion failed: {e}")
+        return np.array(coords)
+
+def createGrid(shapefilePath, resolution, useDegree=True):
+    """Create grid from shapefile bounds"""
+    print(" - Loading shapefile and creating grid")
+    
+    gdf = gpd.read_file(shapefilePath)
+    print(f"   Loaded shapefile with {len(gdf)} features")
+
+    if useDegree:
+        gdf = gdf.to_crs(epsg=4326)
+    
+    minx, miny, maxx, maxy = gdf.total_bounds
+    print(f"   Bounds: minx={minx:.4f}, miny={miny:.4f}, maxx={maxx:.4f}, maxy={maxy:.4f}")
+    
+    x = np.arange(minx, maxx, resolution)
+    y = np.arange(miny, maxy, resolution)
+    xx, yy = np.meshgrid(x, y)
+    
+    print(f"   Grid shape: {xx.shape} ({xx.shape[0] * xx.shape[1]} cells)")
+    
+    # Create mask for cells within boundary
+    x0 = xx.ravel()
+    y0 = yy.ravel()
+    x1 = x0 + resolution
+    y1 = y0 + resolution
+    
+    polygons = [box(x0[i], y0[i], x1[i], y1[i]) for i in range(len(x0))]
+    gridGdf = gpd.GeoDataFrame({'geometry': polygons}, crs=gdf.crs)
+    
+    print(" - Calculating intersections with boundary")
+    unionGeom = gdf.unary_union
+    gridGdf['within'] = gridGdf.intersects(unionGeom)
+    
+    withinMask = gridGdf['within'].to_numpy(dtype=bool).reshape(xx.shape)
+    
+    return xx, yy, withinMask, gdf.crs, minx, miny
+
+def assignStationsToGrid(xx, yy, withinMask, stations, minx, miny, resolution, crs):
+    """Assign station data to grid cells - no interpolation, raw data only"""
+    
+    # Convert station coordinates
+    stationCoords = [(station.lon, station.lat) for station in stations]
+    knownPoints = convertCoordinates(stationCoords, 4326, crs)
+    
+    assignedValues = np.full(xx.shape, np.nan, dtype=np.float32)
+    nrows, ncols = cast(tuple[int, int], assignedValues.shape)
+    
+    if len(knownPoints) > 0:
+        lonTransformed = knownPoints[:, 0]
+        latTransformed = knownPoints[:, 1]
+        
+        # Calculate grid indices
+        colIndices = np.round((lonTransformed - minx) / resolution).astype(int)
+        rowIndices = np.round((latTransformed - miny) / resolution).astype(int)
+        # Removed the incorrect flip: rowIndices = nrows - 1 - rowIndices
+        
+        # Ensure within bounds
+        colIndices = np.clip(colIndices, 0, ncols - 1)
+        rowIndices = np.clip(rowIndices, 0, nrows - 1)
+        
+        # Assign station values to grid cells (first station wins if multiple in same cell)
+        for i, station in enumerate(stations):
+            if not np.isnan(station.value):
+                row = rowIndices[i]
+                col = colIndices[i]
+                
+                # Only assign if cell is within boundary and not already assigned
+                if withinMask[row, col] and np.isnan(assignedValues[row, col]):
+                    assignedValues[row, col] = station.value
+    
+    # Set cells outside boundary to NaN
+    assignedValues[~withinMask] = np.nan
+    
+    return assignedValues
+
+
+def createPolygonFromOuterPoints(pointsGdf: geopandas.GeoDataFrame, alpha: float = 1.6, keepHoles: bool = False, buffer: float = 0) -> geopandas.GeoDataFrame:
+    """
+    Concave hull (alpha-shape) from points.
+    alpha: larger -> tighter/more detailed; too large can fragment.
+    keepHoles: keep interior holes if True, otherwise drop them.
+    """
+
+    pointsGdf = pointsGdf[pointsGdf.geometry.type.eq("Point") & pointsGdf.geometry.notna()]
+    if pointsGdf.empty or pointsGdf.geometry.nunique() < 3:
+        raise ValueError("need at least three distinct points")
+
+    # coordinates (N, 2)
+    coords = numpy.array([(cast(Point, g).x, cast(Point, g).y) for g in pointsGdf.geometry])
+
+    tri = scipy.spatial.Delaunay(coords)
+    simplices = tri.simplices  # (M, 3) indices into coords
+    triPts = coords[simplices] # (M, 3, 2)
+
+    # side lengths
+    a = numpy.linalg.norm(triPts[:, 1] - triPts[:, 2], axis=1)
+    b = numpy.linalg.norm(triPts[:, 0] - triPts[:, 2], axis=1)
+    c = numpy.linalg.norm(triPts[:, 0] - triPts[:, 1], axis=1)
+
+    s = (a + b + c) / 2.0
+    # heron area, guard against tiny/negative due to fp error
+    areaSq = numpy.maximum(s * (s - a) * (s - b) * (s - c), 0.0)
+    area = numpy.sqrt(areaSq)
+    valid = area > 0.0
+    if not numpy.any(valid):
+        hull = pointsGdf.unary_union.convex_hull
+        return geopandas.GeoDataFrame({"name": ["outerBoundary"]}, geometry=[hull], crs=pointsGdf.crs)
+
+    circumradius = (a * b * c) / (4.0 * area)
+    keep = valid & (circumradius < (1.0 / alpha))
+    keptSimplices = simplices[keep]
+    if keptSimplices.size == 0:
+        hull = pointsGdf.unary_union.convex_hull
+        return geopandas.GeoDataFrame({"name": ["outerBoundary"]}, geometry=[hull], crs=pointsGdf.crs)
+
+    # count triangle edges; boundary edges appear exactly once
+    edgeCounts: dict[tuple[int, int], int] = {}
+    for i0, i1, i2 in keptSimplices:
+        for e in ((i0, i1), (i1, i2), (i2, i0)):
+            key = (e[0], e[1]) if e[0] < e[1] else (e[1], e[0])
+            edgeCounts[key] = edgeCounts.get(key, 0) + 1
+
+    boundaryLines = [
+        LineString([coords[i], coords[j]])
+        for (i, j), count in edgeCounts.items()
+        if count == 1
+    ]
+    if not boundaryLines:
+        hull = pointsGdf.unary_union.convex_hull
+        return geopandas.GeoDataFrame({"name": ["outerBoundary"]}, geometry=[hull], crs=pointsGdf.crs)
+
+    polygons = list(polygonize(boundaryLines))
+    if not polygons:
+        hull = pointsGdf.unary_union.convex_hull
+        return geopandas.GeoDataFrame({"name": ["outerBoundary"]}, geometry=[hull], crs=pointsGdf.crs)
+
+    merged = unary_union(polygons)
+    if isinstance(merged, MultiPolygon):
+        merged = max(merged.geoms, key=lambda g: g.area)
+    if not keepHoles and isinstance(merged, Polygon):
+        merged = Polygon(merged.exterior)
+
+    gdf = geopandas.GeoDataFrame({"name": ["outerBoundary"]}, geometry=[merged], crs=pointsGdf.crs)
+    if buffer != 0:
+        gdf.geometry = gdf.geometry.buffer(buffer)
+    return gdf
+
+
+def pointsToGeodataframe(
+    rowList: list,
+    columnNames: list,
+    latIndex: int,
+    lonIndex: int,
+    auth: str = "EPSG",
+    code: str = "4326",
+    outShape: str = "",
+    format: str = "gpkg",
+    v: bool = False,
+    includeLatLon: bool = True ) -> geopandas.GeoDataFrame:
+    df = pandas.DataFrame(rowList, columns = columnNames)
+    geometry = [
+        Point(row[lonIndex], row[latIndex]) for row in rowList
+    ]
+
+    if not includeLatLon:
+        colsToKeep = [col for i, col in enumerate(columnNames) if i not in (latIndex, lonIndex)]
+        df = df[colsToKeep]
+
+    gdf = geopandas.GeoDataFrame(df, geometry = geometry)
+    drivers = {"gpkg": "GPKG", "shp": "ESRI Shapefile"}
+    gdf = gdf.set_crs(f"{auth}:{code}")
+
+    if outShape != "":
+        if v:
+            print(f"creating shapefile {outShape}")
+        gdf.to_file(outShape, driver = drivers[format])
+
+    return gdf
+
+_worker_state: Dict[str, Any] = {}
+
+
+def _process_initializer(
+    values_name: str,
+    values_shape: Tuple[int, int],
+    values_dtype: str,
+    row_indices: np.ndarray,
+    col_indices: np.ndarray,
+    grid_shape: Tuple[int, int],
+):
+    """Initializer for worker processes to attach shared arrays."""
+
+    shm = shared_memory.SharedMemory(name=values_name)
+    values = np.ndarray(values_shape, dtype=np.dtype(values_dtype), buffer=shm.buf)
+
+    _worker_state['values'] = values
+    _worker_state['row_indices'] = row_indices
+    _worker_state['col_indices'] = col_indices
+    _worker_state['grid_shape'] = grid_shape
+    _worker_state['timesteps'] = values_shape[1]
+    _worker_state['shared_memory'] = shm
+
+    import atexit
+
+    atexit.register(shm.close)
+
+
+def processTimestepBatch(timeIndices: List[int]) -> List[Tuple[int, np.ndarray]]:
+    """Process a batch of timestep indices using shared worker state."""
+
+    values: np.ndarray = _worker_state['values']
+    row_indices: np.ndarray = _worker_state['row_indices']
+    col_indices: np.ndarray = _worker_state['col_indices']
+    grid_shape: Tuple[int, int] = _worker_state['grid_shape']
+    max_timesteps: int = _worker_state['timesteps']
+
+    results: List[Tuple[int, np.ndarray]] = []
+    for timeIndex in timeIndices:
+        grid = np.empty(grid_shape, dtype=np.float32)
+        grid.fill(np.nan)
+
+        if timeIndex < 0 or timeIndex >= max_timesteps:
+            results.append((timeIndex, grid))
+            continue
+
+        timestep_values = values[:, timeIndex]
+        valid = ~np.isnan(timestep_values)
+
+        if valid.any():
+            grid[row_indices[valid], col_indices[valid]] = timestep_values[valid].astype(np.float32, copy=False)
+
+        results.append((timeIndex, grid))
+
+    return results
+
+
+def prepareStationArrays(
+    stations: List[StationData],
+    withinMask: np.ndarray,
+    minx: float,
+    miny: float,
+    resolution: float,
+    crs,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Precompute grid indices and value matrix for a variable's stations."""
+
+    if not stations:
+        empty_indices = np.empty(0, dtype=np.int32)
+        empty_values = np.empty((0, 0), dtype=np.float32)
+        return empty_indices, empty_indices, empty_values, 0
+
+    stationCoords = [(station.lon, station.lat) for station in stations]
+    converted = convertCoordinates(stationCoords, 4326, crs) if stationCoords else np.empty((0, 2))
+
+    if converted.size == 0:
+        empty_indices = np.empty(0, dtype=np.int32)
+        empty_values = np.empty((0, 0), dtype=np.float32)
+        return empty_indices, empty_indices, empty_values, 0
+
+    nrows, ncols = cast(tuple[int, int], withinMask.shape)
+
+    lonTransformed = converted[:, 0]
+    latTransformed = converted[:, 1]
+
+    colIndices = np.round((lonTransformed - minx) / resolution).astype(np.int32)
+    rowIndices = np.round((latTransformed - miny) / resolution).astype(np.int32)
+
+    colIndices = np.clip(colIndices, 0, ncols - 1)
+    rowIndices = np.clip(rowIndices, 0, nrows - 1)
+
+    keep_mask = np.zeros(len(stations), dtype=bool)
+    filtered_indices: List[int] = []
+    seen_cells: set[Tuple[int, int]] = set()
+
+    for idx, (row, col) in enumerate(zip(rowIndices, colIndices)):
+        cell = (int(row), int(col))
+        if cell in seen_cells:
+            continue
+        if not withinMask[row, col]:
+            continue
+        seen_cells.add(cell)
+        keep_mask[idx] = True
+        filtered_indices.append(idx)
+
+    if not filtered_indices:
+        empty_indices = np.empty(0, dtype=np.int32)
+        empty_values = np.empty((0, 0), dtype=np.float32)
+        return empty_indices, empty_indices, empty_values, 0
+
+    filtered_rows = rowIndices[keep_mask]
+    filtered_cols = colIndices[keep_mask]
+
+    numTimesteps = max(len(stations[idx].timeSeries) for idx in filtered_indices)
+    values = np.full((len(filtered_indices), numTimesteps), np.nan, dtype=np.float32)
+
+    for out_idx, station_idx in enumerate(filtered_indices):
+        time_series = stations[station_idx].timeSeries
+        if not time_series:
+            continue
+        series_values = np.fromiter((val for _, val in time_series), dtype=np.float32, count=len(time_series))
+        values[out_idx, : len(time_series)] = series_values
+
+    return filtered_rows, filtered_cols, values, numTimesteps
+
+
+def processFiles(fileList, fileType, varNames):
+    global referenceDate
+    if not fileList:
+        return
+    print(f"Processing {fileType} ({len(fileList)} files)")
+    
+    for i, filePath in enumerate(fileList):
+        if i % 10 == 0:
+            print(f"  {i+1}/{len(fileList)}", end='\r', flush=True)
+        
+        try:
+            for varName in varNames:
+                if varName not in allStationDetails:
+                    allStationDetails[varName] = []
+            
+            fc = readFile(filePath)
+            if len(fc) < 3:
+                continue
+            
+            detailsLine = fc[2].split()
+            if len(detailsLine) < 5:
+                continue
+            
+            lat = float(detailsLine[2].strip())
+            lon = float(detailsLine[3].strip())
+            elev = float(detailsLine[4].strip())
+            
+            varDetails = []
+            for varName in varNames:
+                detail = StationData()
+                detail.lat = lat
+                detail.lon = lon
+                detail.elev = elev
+                detail.timeSeries = []
+                varDetails.append(detail)
+                allStationDetails[varName].append(detail)
+            
+            for line in fc[3:]:
+                lineParts = line.strip().split()
+                if len(lineParts) < len(varNames) + 2:
+                    continue
+                
+                try:
+                    currentDate = datetime.datetime(int(lineParts[0]), 1, 1) + datetime.timedelta(days=int(lineParts[1]) - 1)
+                    if referenceDate is None:
+                        referenceDate = currentDate
+                    
+                    for j, varDetail in enumerate(varDetails):
+                        value = float(lineParts[2 + j])
+                        varDetail.timeSeries.append((currentDate, value))
+                    
+                    if stopDate and currentDate >= stopDate:
+                        break
+                except (ValueError, IndexError):
+                    continue
+        except Exception as e:
+            print(f"Error processing {filePath}: {e}")
+            continue
+    
+def processData(
+    xx: np.ndarray,
+    yy: np.ndarray,
+    withinMask: np.ndarray,
+    crs,
+    minx: float,
+    miny: float,
+    resolution: float,
+    allStationDetails: Dict[str, List[StationData]],
+    ncVars: Dict[str, Any],
+    varTimesteps: Dict[str, int],
+    maxWorkers: int | None = None,
+    batchSize: int = 500,
+    writeChunkSize: int = 64,
+) -> None:
+    """Process data with parallel processing and stream results into NetCDF."""
+
+    if maxWorkers is None:
+        cpuCount = mp.cpu_count()
+        maxWorkers = min(cpuCount - 2, 60) if cpuCount > 4 else max(1, cpuCount - 1)
+
+    print(f" - Using {maxWorkers} worker processes with batch size {batchSize}")
+
+    grid_shape = (int(xx.shape[0]), int(xx.shape[1]))
+
+    for varIdx, (var, stations) in enumerate(allStationDetails.items(), start=1):
+        print(f"\n - Processing variable {varIdx}/{len(allStationDetails)}: {var}")
+
+        row_indices, col_indices, values, numTimesteps = prepareStationArrays(
+            stations, withinMask, minx, miny, resolution, crs
+        )
+
+        expected_timesteps = varTimesteps.get(var, numTimesteps)
+
+        if numTimesteps == 0 or values.size == 0:
+            print(f"   Warning: No usable station data for variable {var}")
+            continue
+
+        print(f"   {values.shape[0]} grid-assigned stations, {numTimesteps} timesteps")
+
+        batches: List[List[int]] = [
+            list(range(i, min(i + batchSize, numTimesteps))) for i in range(0, numTimesteps, batchSize)
+        ]
+        print(f"   Processing in {len(batches)} batches")
+
+        shared = shared_memory.SharedMemory(create=True, size=values.nbytes)
+        shared_array = np.ndarray(values.shape, dtype=values.dtype, buffer=shared.buf)
+        np.copyto(shared_array, values)
+        values_shape = (int(shared_array.shape[0]), int(shared_array.shape[1]))
+        values_dtype = str(shared_array.dtype)
+
+        del shared_array
+        values = None  # free local copy
+
+        row_indices = np.ascontiguousarray(row_indices, dtype=np.int32)
+        col_indices = np.ascontiguousarray(col_indices, dtype=np.int32)
+
+        pending: Dict[int, np.ndarray] = {}
+        next_write_index = 0
+        chunk_buffer: List[np.ndarray] = []
+        chunk_start = 0
+
+        def flush_chunk() -> None:
+            nonlocal chunk_buffer, chunk_start
+            if not chunk_buffer:
+                return
+            data = np.stack(chunk_buffer, axis=0).astype(np.float32, copy=False)
+            filled = np.where(np.isnan(data), -9999.0, data).astype(np.float32, copy=False)
+            end_index = chunk_start + filled.shape[0]
+            ncVars[var][chunk_start:end_index, :, :] = filled
+            chunk_buffer = []
+
+        completedBatches = 0
+
+        try:
+            with ProcessPoolExecutor(
+                max_workers=maxWorkers,
+                initializer=_process_initializer,
+                initargs=(
+                    shared.name,
+                    values_shape,
+                    values_dtype,
+                    row_indices,
+                    col_indices,
+                    grid_shape,
+                ),
+            ) as executor:
+                futures = {executor.submit(processTimestepBatch, batch): batch for batch in batches}
+
+                for future in as_completed(futures):
+                    try:
+                        batchResults = future.result(timeout=300)
+                    except Exception as exc:
+                        print(f"\n   Warning: Batch failed: {exc}")
+                        continue
+
+                    completedBatches += 1
+                    for timeIndex, grid in batchResults:
+                        pending[timeIndex] = grid
+
+                    while next_write_index in pending:
+                        grid = pending.pop(next_write_index)
+                        if not chunk_buffer:
+                            chunk_start = next_write_index
+                        chunk_buffer.append(grid)
+                        next_write_index += 1
+
+                        if len(chunk_buffer) >= writeChunkSize:
+                            flush_chunk()
+
+                    if batches:
+                        progress = (completedBatches / len(batches)) * 100
+                        print(
+                            f"\r   Progress: {progress:.1f}% ({completedBatches}/{len(batches)} batches)",
+                            end='',
+                            flush=True,
+                        )
+
+            flush_chunk()
+
+            if batches:
+                print()
+
+            if pending:
+                remaining_indices = sorted(pending.keys())
+                for timeIndex in remaining_indices:
+                    grid = pending.pop(timeIndex)
+                    if not chunk_buffer:
+                        chunk_start = timeIndex
+                    chunk_buffer.append(grid)
+                    next_write_index = timeIndex + 1
+                    if len(chunk_buffer) >= writeChunkSize:
+                        flush_chunk()
+                flush_chunk()
+
+        finally:
+            shared.close()
+            shared.unlink()
+
+        print("\n   Completed", var)
+        if next_write_index < expected_timesteps:
+            print(f"   Warning: expected {expected_timesteps} timesteps, wrote {next_write_index}")
+
+def createNetcdf(
+    xx: np.ndarray,
+    yy: np.ndarray,
+    resolution: float,
+    outputFile: str,
+    crs,
+    refDate: datetime.datetime,
+    varTimesteps: Dict[str, int],
+) -> Tuple[Any, Any, Dict[str, Any], int]:
+    """Create NetCDF file and return handles for streaming writes."""
+
+    if Dataset is None:
+        print("Error: netCDF4 not available. Cannot create NetCDF file.")
+        raise RuntimeError("netCDF4 unavailable")
+
+    print(" - Creating NetCDF file")
+
+    ncFile = Dataset(outputFile, 'w', format='NETCDF4', clobber=True)
+
+    try:
+        ncFile.createDimension('time', None)
+        ncFile.createDimension('lat', xx.shape[0])
+        ncFile.createDimension('lon', xx.shape[1])
+
+        times = ncFile.createVariable('time', 'f8', ('time',))
+        latitudes = ncFile.createVariable('lat', 'f4', ('lat',), zlib=True, complevel=9)
+        longitudes = ncFile.createVariable('lon', 'f4', ('lon',), zlib=True, complevel=9)
+
+        latitudes[:] = yy[:, 0].astype(np.float32)
+        longitudes[:] = xx[0, :].astype(np.float32)
+
+        latitudes.units = 'degrees_north'
+        latitudes.long_name = 'latitude'
+        longitudes.units = 'degrees_east'
+        longitudes.long_name = 'longitude'
+        times.units = 'days since 1970-01-01 00:00:00.0'
+        times.calendar = 'gregorian'
+
+        maxTimesteps = max(varTimesteps.values()) if varTimesteps else 0
+        chunkTime = min(200, max(1, maxTimesteps // 8)) if maxTimesteps else 1
+        chunkLat = min(100, max(10, xx.shape[0] // 4))
+        chunkLat = min(chunkLat, xx.shape[0])
+        chunkLon = min(100, max(10, xx.shape[1] // 4))
+        chunkLon = min(chunkLon, xx.shape[1])
+
+        ncVars: Dict[str, Any] = {}
+        for varName in varTimesteps.keys():
+            print(f"   Creating variable: {varName}")
+            ncVar = ncFile.createVariable(
+                varName,
+                'f4',
+                ('time', 'lat', 'lon'),
+                fill_value=-9999,
+                zlib=True,
+                complevel=9,
+                shuffle=True,
+                fletcher32=True,
+                chunksizes=(chunkTime, chunkLat, chunkLon),
+            )
+
+            ncVar.grid_mapping = "crs"
+
+            if varName == "pcp":
+                ncVar.units = "mm/day"
+                ncVar.long_name = "Precipitation"
+            elif varName == "tmin":
+                ncVar.units = "degrees_Celsius"
+                ncVar.long_name = "Daily minimum temperature"
+            elif varName == "tmax":
+                ncVar.units = "degrees_Celsius"
+                ncVar.long_name = "Daily maximum temperature"
+            elif varName == "slr":
+                ncVar.units = "MJ/m^2/day"
+                ncVar.long_name = "Solar radiation"
+            elif varName == "hmd":
+                ncVar.units = "fraction"
+                ncVar.long_name = "Relative humidity"
+            elif varName == "wnd":
+                ncVar.units = "m/s"
+                ncVar.long_name = "Wind speed"
+
+            ncVars[varName] = ncVar
+
+        crsVar = ncFile.createVariable('crs', 'i4')
+        try:
+            crsVar.spatial_ref = crs.to_wkt() if hasattr(crs, 'to_wkt') else str(crs)
+        except Exception:
+            crsVar.spatial_ref = "EPSG:4326"
+        crsVar.grid_mapping_name = "latitude_longitude"
+
+        ncFile.title = "SWAT+ Weather Data Grid - @celray"
+        ncFile.description = "Gridded weather data - raw station values only converted from SWAT+ weather files to NetCDF format by SWAT+ NetCDF Converter (@celray)"
+        ncFile.history = f"Created on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        ncFile.conventions = "CF-1.7"
+
+        return ncFile, times, ncVars, maxTimesteps
+
+    except Exception:
+        ncFile.close()
+        raise
+
+
+def writeTimeCoordinates(timesVar: Any, numTimesteps: int, refDate: datetime.datetime | None) -> None:
+    """Populate the NetCDF time coordinate."""
+
+    if numTimesteps <= 0:
+        return
+
+    if refDate and date2num:
+        timeVals = np.empty(numTimesteps, dtype=np.float64)
+        for i in range(numTimesteps):
+            try:
+                dateVal = refDate + datetime.timedelta(days=i)
+                timeVals[i] = date2num(dateVal, units=timesVar.units, calendar=timesVar.calendar)
+            except Exception:
+                timeVals[i] = float(i)
+    else:
+        timeVals = np.arange(numTimesteps, dtype=np.float64)
+
+    timesVar[0:numTimesteps] = timeVals
+
+
+def createPath(pathName: str, v: bool = False) -> str:
+    '''
+    this function creates a directory if it does not exist
+    pathName: the path to create
+    v: verbose (default is False)
+    '''
+    if pathName == '':
+        return './'
+
+    if pathName.endswith('\\'): pathName = pathName[:-1]
+    if not pathName.endswith('/'): pathName += '/'
+
+    if not os.path.isdir(pathName):
+        os.makedirs(pathName)
+        if v: print(f"\t> created path: {pathName}")
+    if pathName.endswith("/"): pathName = pathName[:-1]
+    return pathName
+
+
+def listFiles(directory, extension):
+    try:
+        import glob
+        pattern = os.path.join(directory, f"*{extension}")
+        return glob.glob(pattern)
+    except Exception as e:
+        print(f"Error listing files: {e}")
+        return []
+
+def readFile(filepath):
+    try:
+        with open(filepath, 'r') as f:
+            return f.readlines()
+    except Exception as e:
+        print(f"Error reading file {filepath}: {e}")
+        return []
+
+if __name__ == "__main__":
+    print("Simple SWAT Weather to NetCDF Converter - Raw Data Only")
+    
+    cpuCount = mp.cpu_count()
+    print(f"System: {cpuCount} CPU cores detected")
+    import argparse, datetime
+
+    now = datetime.datetime.now()
+    
+    parser = argparse.ArgumentParser(description="Simple SWAT Weather to NetCDF Converter")
+    parser.add_argument("-bs", "--boundary", type=str, default="", help="Path to the bounds shapefile")
+    parser.add_argument("-o", "--output", type=str, default="", help="Output NetCDF file path")
+    parser.add_argument("-res", "--resolution", type=float, default=0.5, help="Grid resolution in degrees")
+    parser.add_argument("-wd", "--weather-dir", type=str, default="", help="Path to SWAT+ weather directory")
+    parser.add_argument("-sd", "--stop-date", type=str, default=f"{now.year}-{now.month}-{now.day}", help="Stop date for processing (YYYY-MM-DD)")
+    
+    # add optional batch size and max workers
+    parser.add_argument("-sb", "--batch-size", type=int, default=500, help="Batch size for processing")
+    parser.add_argument("-mw", "--max-workers", type=int, default=120, help="Maximum number of worker processes")
+
+    args = parser.parse_args()
+
+    resolution = args.resolution
+    outputFileName = args.output
+    if not outputFileName:
+        print("Error: Output file name not specified. Use -o or --output to specify the output file.")
+        sys.exit(1)
+    else: createPath(os.path.dirname(outputFileName))
+
+    swatWeatherDir = args.weather_dir
+    if not swatWeatherDir:
+        print("Error: Weather directory path not specified. Use -wd or --weather-dir to specify the directory.")
+        sys.exit(1)
+    
+    stopDate = datetime.datetime.strptime(args.stop_date, "%Y-%m-%d") if args.stop_date else None
+
+    referenceDate = None
+    
+    # Performance settings
+    maxWorkers = min(120, cpuCount - 2) if cpuCount > 4 else max(1, cpuCount - 1) if not args.max_workers else args.max_workers
+    batchSize = 500 if not args.batch_size else args.batch_size
+    
+    print(f"Configuration:")
+    print(f"  Max workers: {maxWorkers}")
+    print(f"  Batch size: {batchSize}")
+    print(f"  Output: {outputFileName}")
+    print(f"  Grid resolution: {resolution} degrees")
+    
+
+    if not os.path.exists(swatWeatherDir):
+        print(f"Error: Weather directory not found: {swatWeatherDir}")
+        sys.exit(1)
+    
+    totalStartTime = time.time()
+    
+    
+    print("loading weather files list")
+        
+    allStationDetails = {}
+    
+    # Get file lists
+    pcpFiles = listFiles(swatWeatherDir, ".pcp")
+    tmpFiles = listFiles(swatWeatherDir, ".tem")
+    tmpFiles += listFiles(swatWeatherDir, ".tmp")
+    slrFiles = listFiles(swatWeatherDir, ".slr")
+    hmdFiles = listFiles(swatWeatherDir, ".hmd")
+    wndFiles = listFiles(swatWeatherDir, ".wnd")
+
+
+    shapefilePath = args.boundary
+    if not shapefilePath:
+        print("! boundary shapefile path not specified. use -bs or --boundary to specify the shapefile.\n  converter will use weather station points to estimate bounds")
+        
+    # Check paths
+    if shapefilePath:
+        if not os.path.exists(shapefilePath):
+            print(f"! shapefile not found: {shapefilePath}\n  skip this argument to use weather station points to estimate bounds")
+            sys.exit(1)
+    
+    if not shapefilePath:
+        coordinatePairs = []
+
+        for filePth in (pcpFiles + tmpFiles + slrFiles + hmdFiles + wndFiles):
+
+            _, _, lat, lon, _   = readFile(filePth)[2].strip().split()
+            stationName         = readFile(filePth)[0].strip().split(":")[0]
+            lat, lon            = float(lat), float(lon)
+
+            if not (lat, lon, stationName) in coordinatePairs: coordinatePairs.append((lat, lon, stationName))
+
+        shapefilePath = os.path.splitext(outputFileName)[0] + "Bounds.gpkg"
+        createPolygonFromOuterPoints(pointsToGeodataframe(coordinatePairs, ["lat", "lon", "stationName"], 0, 1)).geometry.buffer(resolution).to_file(shapefilePath, driver = "GPKG")
+    
+    
+    print(f"found: PCP={len(pcpFiles)}, TMP={len(tmpFiles)}, SLR={len(slrFiles)}, HMD={len(hmdFiles)}, WND={len(wndFiles)}")
+    
+    if sum([len(pcpFiles), len(tmpFiles), len(slrFiles), len(hmdFiles), len(wndFiles)]) == 0:
+        print("Error: No weather files found")
+        sys.exit(1)
+    
+    
+    # Process all file types
+    processFiles(pcpFiles, "Precipitation", ["pcp"])
+    processFiles(tmpFiles, "Temperature", ["tmax", "tmin"])
+    processFiles(slrFiles, "Solar Radiation", ["slr"])
+    processFiles(hmdFiles, "Humidity", ["hmd"])
+    processFiles(wndFiles, "Wind", ["wnd"])
+    
+    if referenceDate is None:
+        print("Warning: No valid dates found. Using default reference date.")
+        referenceDate = datetime.datetime(1979, 1, 1)
+    
+    print(f"\nReference date: {referenceDate}")
+    
+    print(f"\nData loaded:")
+    varTimesteps: Dict[str, int] = {}
+    for varName, stations in allStationDetails.items():
+        lengths = [len(station.timeSeries) for station in stations if station.timeSeries]
+        numTimesteps = max(lengths) if lengths else 0
+        varTimesteps[varName] = numTimesteps
+        print(f"  {varName}: {len(stations)} stations, {numTimesteps} timesteps")
+
+    if not varTimesteps or all(count == 0 for count in varTimesteps.values()):
+        print("Error: No usable time series data loaded")
+        sys.exit(1)
+
+    print("\n" + "="*60)
+    print("PROCESSING DATA - RAW VALUES ONLY")
+    print("="*60)
+
+    try:
+        gridXx, gridYy, withinMask, crs, minx, miny = createGrid(shapefilePath, resolution, useDegree=True)
+    except Exception as e:
+        print(f"Error generating grid: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    try:
+        ncFile, timesVar, ncVars, maxTimesteps = createNetcdf(
+            gridXx, gridYy, resolution, outputFileName, crs, referenceDate, varTimesteps
+        )
+    except Exception as e:
+        print(f"Error creating NetCDF structure: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    processingStart = time.time()
+    try:
+        processData(
+            gridXx,
+            gridYy,
+            withinMask,
+            crs,
+            minx,
+            miny,
+            resolution,
+            allStationDetails,
+            ncVars,
+            varTimesteps,
+            maxWorkers=maxWorkers,
+            batchSize=batchSize,
+            writeChunkSize=min(128, max(1, batchSize)),
+        )
+        processingTime = time.time() - processingStart
+        print(f"\nProcessing completed in {processingTime:.1f} seconds")
+    except Exception as e:
+        print(f"Error in processing: {e}")
+        import traceback
+        traceback.print_exc()
+        ncFile.close()
+        sys.exit(1)
+
+    print("\n" + "="*60)
+    print("FINALIZING NETCDF FILE")
+    print("="*60)
+
+    try:
+        writeTimeCoordinates(timesVar, maxTimesteps, referenceDate)
+        ncFile.sync()
+        ncFile.close()
+
+        if os.path.exists(outputFileName):
+            fileSize = os.path.getsize(outputFileName) / (1024**2)
+            print(f"Output file size: {fileSize:.1f} MB")
+
+    except Exception as e:
+        print(f"Error finalizing NetCDF: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            ncFile.close()
+        except Exception:
+            pass
+        sys.exit(1)
+
+    totalTime = time.time() - totalStartTime
+    print("\n" + "="*60)
+    print("PROCESSING COMPLETE!")
+    print("="*60)
+    print(f"Total time: {totalTime:.1f} seconds ({totalTime/60:.1f} minutes)")
+
+    totalTimestepsApprox = sum(varTimesteps.values())
+    if totalTime > 0 and totalTimestepsApprox > 0:
+        print(f"Performance: {totalTimestepsApprox/totalTime:.1f} timesteps/second (approx)")
+
+    print(f"Output: {outputFileName}")
+    print("NetCDF contains raw station data only - no interpolation applied")
+    print("Grid cells without stations contain NaN values")

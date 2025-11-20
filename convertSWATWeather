@@ -1,0 +1,144 @@
+#!/cbin/bin/python3
+
+'''
+this script creates weather-sta.cli equivalent for netcdf
+and prepares the netcdf data package for swatNetCDF
+
+Author  : Celray James CHAWANDA
+Email   : celray.chawanda@outlook.com
+Licence : All rights Reserved
+Repo    : https://github.com/celray
+
+Date    : 2024-09-30 - 11:32
+'''
+
+# imports
+from ccfx import (createPath, readFile, writeFile, readFrom, listFiles,
+                  os, getFileBaseName, copyFile, deletePath, exists, alert,)
+import argparse
+
+# set default working directory to the script location
+os.chdir(os.path.dirname(__file__))
+
+# variables
+parser = argparse.ArgumentParser(description="Convert SWAT weather data to NetCDF format.")
+parser.add_argument('--region', type=str, required=True, help='Region name (e.g., 01010010)')
+parser.add_argument('--txtInOutDir', type=str, required=True, help='Directory containing SWAT text weather files')
+parser.add_argument('--convertedDir', type=str, required=True, help='Directory to save converted NetCDF files')
+parser.add_argument('--climateResolution', type=float, default=0.25, help='Climate resolution in meters (default: 0.25)')
+
+# add optional arguments, shapePath and stop date (stopDate)
+parser.add_argument('--shapePath', type=str, required=False, help='Optional path to shape file')
+parser.add_argument('--stopDate', type=str, required=False, help='Optional stop date (format: YYYY-MM-DD)')
+
+args = parser.parse_args()
+
+regionName          = args.region
+txtInOutDir         = args.txtInOutDir
+weatherSrcDir       = args.txtInOutDir
+convertedDir        = args.convertedDir
+stationListFile     = f"{convertedDir}/netcdf.ncw"
+sourceweatherSta    = f"{txtInOutDir}/weather-sta.cli"
+climateResolution   = args.climateResolution
+shapePath           = args.shapePath if args.shapePath else None
+stopDate            = args.stopDate if args.stopDate else "1985-12-31"
+
+
+# if any of thee args is not given, cimplain and exit
+if not regionName or not txtInOutDir or not convertedDir:
+    print("Error: Missing required arguments. Please provide --region, --txtInOutDir, and --convertedDir.")
+    exit(1)
+
+if not exists(txtInOutDir):
+    print(f"Error: The specified txtInOutDir '{txtInOutDir}' does not exist.")
+    exit(1)
+
+if not exists(sourceweatherSta):
+    print(f"Error: The specified sourceweatherSta '{sourceweatherSta}' does not exist.")
+    exit(1)
+
+# delete old converted directory if it exists
+if exists(convertedDir):
+    alert(f"deleting old converted directory at {convertedDir}", "http://suite.chawanda.com", "pythonAlerts", messageTitle="Deleting old converted directory")
+    deletePath(convertedDir)
+
+# create destination
+createPath(convertedDir)
+
+alert(f"listing files in {txtInOutDir}", "http://suite.chawanda.com", "pythonAlerts", messageTitle="Listing files in TxtInOut directory")
+badExtensions       = [".cli", ".tmp", ".wnd", ".slr", ".hmd", ".pcp", ".tem"]
+mustFiles           = ['weather-wgn.cli']
+filesList           = [fn for fn in listFiles(txtInOutDir) if (not os.path.isdir(fn) and not any(fn.endswith(ext) for ext in badExtensions))]
+
+alert(f"found {len(filesList)} files in {txtInOutDir}", "http://suite.chawanda.com", "pythonAlerts", messageTitle="Files found in TxtInOut directory")
+print("getting swat files...")
+alert(f"copying files to {convertedDir}", "http://suite.chawanda.com", "pythonAlerts", messageTitle="Copying files to converted directory")
+for file in filesList:
+    if file.endswith(".txt"): continue
+    copyFile(file, f"{convertedDir}/{getFileBaseName(file)}", v=False)
+
+for mustFile in mustFiles: copyFile(f"{txtInOutDir}/{mustFile}", f"{convertedDir}/{mustFile}", v=False)
+
+alert(f"formatting file.cio", "http://suite.chawanda.com", "pythonAlerts", messageTitle="Formatting file.cio")
+print("formating file.cio...")
+cioFC = readFile(f"{txtInOutDir}/file.cio", v=False)[1:]
+
+cioFC = [
+    (line if not line.strip().lower().startswith('pcp_path') else line.replace('null', f'{regionName}.nc4')) if not line.strip().lower().startswith("climate") 
+    else ("climate           netcdf.ncw        weather-wgn.cli   null              null              null              null              null              null              null\n")
+    for line in cioFC
+]
+
+fileCIO = "file.cio: written by swat-netcdf converter (@celray)\n" + "".join(cioFC) 
+
+fileCIO = fileCIO.replace("pcp_path          null   ", f"pcp_path          {regionName}.nc4   ")
+fileCIO = fileCIO.replace("tmp_path          null   ", f"tmp_path          {regionName}.nc4   ")
+fileCIO = fileCIO.replace("slr_path          null   ", f"slr_path          {regionName}.nc4   ")
+fileCIO = fileCIO.replace("hmd_path          null   ", f"hmd_path          {regionName}.nc4   ")
+fileCIO = fileCIO.replace("wnd_path          null   ", f"wnd_path          {regionName}.nc4   ")
+
+writeFile(f"{convertedDir}/file.cio", fileCIO, v=True)
+
+# main code
+fc = readFile(sourceweatherSta)
+
+alert(f"creating netcdf.ncw file", "http://suite.chawanda.com", "pythonAlerts", messageTitle="Creating netcdf.ncw file")
+finalString = "netcdf.ncw: written by Celray James\nname                 wgn        latitude     longitude     elevation        pcp       tmin       tmax        slr        hmd       wnd        pet     "
+exampleLine = "s11600n37360e   117n375e          11.686        37.435      1700.000    0.8      1.0       1.0      1.0       1.0      1.0     null        null         null "
+
+for line in fc[2:]:
+    line = line.strip()
+    line = line.split()
+
+    if len(line) == 0:
+        continue
+    
+    stationInfoFC = readFrom(f"{weatherSrcDir}/{line[2]}")
+    coordLine     = stationInfoFC[2].strip().split()
+    latitude      = coordLine[2]
+    longitude     = coordLine[3]
+    elevation     = coordLine[4] 
+
+    neLine = f"{line[0].ljust(14)}"     # station name
+    neLine += f"{line[1].rjust(10)}"    # wgn
+    neLine += f"{latitude.rjust(16)}"   # latitude
+    neLine += f"{longitude.rjust(14)}"  # longitude
+    neLine += f"{elevation.rjust(14)}"  # elevation
+    neLine += f"{'1.0'.rjust(11)}"      # pcp
+    neLine += f"{'1.0'.rjust(11)}"      # tmin
+    neLine += f"{'1.0'.rjust(11)}"      # tmax
+    neLine += f"{'1.0'.rjust(11)}"      # slr
+    neLine += f"{'1.0'.rjust(11)}"      # hmd
+    neLine += f"{'1.0'.rjust(11)}"      # wnd
+    neLine += f"{'null'.rjust(10)}"     # pet
+
+    finalString += f"\n{neLine}"
+
+alert(f"writing {stationListFile}", "http://suite.chawanda.com", "pythonAlerts", messageTitle="Writing station list file")
+writeFile(stationListFile, finalString, v=True)
+alert(f"finished writing {stationListFile}", "http://suite.chawanda.com", "pythonAlerts", messageTitle="Finished writing station list file", attachment=stationListFile)
+
+alert(f"converting weather data to netcdf", "http://suite.chawanda.com", "pythonAlerts", messageTitle="Converting weather data to netcdf")
+os.system(f"swatPlusNetCDFConverter -o {convertedDir}/{regionName}.nc4 -res {climateResolution} -sb 1500 -wd {weatherSrcDir} -sd {stopDate} {'-bs ' + shapePath if shapePath else ''}")
+
+alert(f"finished converting weather data to netcdf", "http://suite.chawanda.com", "pythonAlerts", messageTitle="Finished converting weather data to netcdf")
