@@ -25,12 +25,15 @@ bool cmdOptionExists(char** begin, char** end, const std::string& option)
 }
 
 void printUsage() {
-    std::cout << "Usage: swat_nc_converter --region <RegionName> --txtInOutDir <Path> --convertedDir <Path> [options]" << std::endl;
+    std::cout << "Usage: swat_nc_converter -r <RegionName> -i <InputPath> -o <OutputPath> [options]" << std::endl;
     std::cout << "Options:" << std::endl;
-    std::cout << "  --climateResolution <float>  Resolution in degrees (default: 0.25)" << std::endl;
-    std::cout << "  --shapePath <Path>           Path to shapefile" << std::endl;
-    std::cout << "  --stopDate <YYYY-MM-DD>      Stop date (default: 2500-12-31)" << std::endl;
-    std::cout << "  --help, -h                   Show this help message" << std::endl;
+    std::cout << "  -r,   --region <name>            Region name (required)" << std::endl;
+    std::cout << "  -i,   --inputPath <path>         Input TxtInOut directory (required)" << std::endl;
+    std::cout << "  -o,   --outputPath <path>        Output converted directory (required)" << std::endl;
+    std::cout << "  -res, --climateResolution <float> Resolution in degrees (default: 0.25)" << std::endl;
+    std::cout << "  -b,   --shapePath <path>         Path to shapefile" << std::endl;
+    std::cout << "  -s,   --stopDate <YYYY-MM-DD>    Stop date (default: 2500-12-31)" << std::endl;
+    std::cout << "  -h,   --help                     Show this help message" << std::endl;
 }
 
 int main(int argc, char * argv[]) {
@@ -41,8 +44,9 @@ int main(int argc, char * argv[]) {
 
     // Validate arguments
     std::vector<std::string> validArgs = {
-        "--region", "--txtInOutDir", "--convertedDir", 
-        "--climateResolution", "--shapePath", "--stopDate"
+        "-r", "--region", "-i", "--inputPath", "-o", "--outputPath", 
+        "-res", "--climateResolution", "-b", "--shapePath", "-s", "--stopDate",
+        "-h", "--help"
     };
 
     for (int i = 1; i < argc; ++i) {
@@ -67,28 +71,35 @@ int main(int argc, char * argv[]) {
         }
     }
 
-    char* regionOpt = getCmdOption(argv, argv + argc, "--region");
-    char* txtInOutOpt = getCmdOption(argv, argv + argc, "--txtInOutDir");
-    char* convertedOpt = getCmdOption(argv, argv + argc, "--convertedDir");
-    char* resOpt = getCmdOption(argv, argv + argc, "--climateResolution");
-    char* shapeOpt = getCmdOption(argv, argv + argc, "--shapePath");
-    char* dateOpt = getCmdOption(argv, argv + argc, "--stopDate");
+    // Helper lambda to get option with short/long forms
+    auto getOption = [&](const std::string& shortOpt, const std::string& longOpt) -> char* {
+        char* result = getCmdOption(argv, argv + argc, shortOpt);
+        if (!result) result = getCmdOption(argv, argv + argc, longOpt);
+        return result;
+    };
 
-    if (!regionOpt || !txtInOutOpt || !convertedOpt) {
+    char* regionOpt = getOption("-r", "--region");
+    char* inputPathOpt = getOption("-i", "--inputPath");
+    char* outputPathOpt = getOption("-o", "--outputPath");
+    char* resOpt = getOption("-res", "--climateResolution");
+    char* shapeOpt = getOption("-b", "--shapePath");
+    char* dateOpt = getOption("-s", "--stopDate");
+
+    if (!regionOpt || !inputPathOpt || !outputPathOpt) {
         std::cerr << "Error: Missing required arguments." << std::endl;
         printUsage();
         return 1;
     }
 
     std::string region = regionOpt;
-    std::string txtInOutDir = txtInOutOpt;
-    std::string convertedDir = convertedOpt;
+    std::string inputPath = inputPathOpt;
+    std::string outputPath = outputPathOpt;
     double resolution = resOpt ? std::stod(resOpt) : 0.25;
     std::string shapePath = shapeOpt ? shapeOpt : "";
     std::string stopDate = dateOpt ? dateOpt : "2500-12-31";
 
-    if (!fs::exists(txtInOutDir)) {
-        std::cerr << "Error: Input directory '" << txtInOutDir << "' does not exist." << std::endl;
+    if (!fs::exists(inputPath)) {
+        std::cerr << "Error: Input directory '" << inputPath << "' does not exist." << std::endl;
         return 1;
     }
 
@@ -99,19 +110,19 @@ int main(int argc, char * argv[]) {
 
     std::cout << "Starting SWAT+ NetCDF Converter (C++ Prototype)" << std::endl;
     std::cout << "Region: " << region << std::endl;
-    std::cout << "Input: " << txtInOutDir << std::endl;
-    std::cout << "Output: " << convertedDir << std::endl;
+    std::cout << "Input: " << inputPath << std::endl;
+    std::cout << "Output: " << outputPath << std::endl;
 
     // 1. Prepare Directories and Copy Files (Logic from convertSWATWeather)
-    if (Utils::createDirectory(convertedDir)) {
+    if (Utils::createDirectory(outputPath)) {
         std::cout << "Created output directory." << std::endl;
     }
 
-    bool fileCioExists = fs::exists(txtInOutDir + "/file.cio");
+    bool fileCioExists = fs::exists(inputPath + "/file.cio");
 
     if (fileCioExists) {
         // Copy essential files
-        std::vector<std::string> files = Utils::listFiles(txtInOutDir);
+        std::vector<std::string> files = Utils::listFiles(inputPath);
         
         // Bad extensions to skip
         std::vector<std::string> badExtensions = {".cli", ".tmp", ".wnd", ".slr", ".hmd", ".pcp", ".tem"};
@@ -136,23 +147,23 @@ int main(int argc, char * argv[]) {
             }
             if (isBad) continue;
 
-            Utils::copyFile(file, convertedDir + "/" + filename);
+            Utils::copyFile(file, outputPath + "/" + filename);
         }
         
         // Explicitly copy weather-wgn.cli if it exists
-        std::string wgnFile = txtInOutDir + "/weather-wgn.cli";
+        std::string wgnFile = inputPath + "/weather-wgn.cli";
         if (fs::exists(wgnFile)) {
-             Utils::copyFile(wgnFile, convertedDir + "/weather-wgn.cli");
+             Utils::copyFile(wgnFile, outputPath + "/weather-wgn.cli");
         }
         
         // Update file.cio
-        Utils::updateFileCIO(txtInOutDir, convertedDir, region);
+        Utils::updateFileCIO(inputPath, outputPath, region);
     } else {
         std::cout << "file.cio not found. Skipping file copy and update." << std::endl;
     }
 
     // 2. Run Conversion (Logic from swatPlusNetCDFConverter)
-    Converter converter(region, txtInOutDir, convertedDir);
+    Converter converter(region, inputPath, outputPath);
     converter.run(resolution, shapePath, stopDate);
 
     return 0;
